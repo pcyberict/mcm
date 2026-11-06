@@ -1,5 +1,5 @@
 
-name: win 11 + tailscale + Download.bat script
+name: win 11 + tailscale + Download.bat script + PCYBER Apps
 
 on:
   workflow_dispatch:
@@ -80,22 +80,18 @@ jobs:
 
       # ==========================================
       # 4. ESTABLISH TAILSCALE CONNECTION
-      # ORIGINAL AUTHENTICATION COMMAND RESTORED
+      # ORIGINAL WORKING COMMAND PRESERVED
       # ==========================================
       - name: Establish Tailscale Connection
         shell: pwsh
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
 
-          # Check Tailscale connection
           if ($LASTEXITCODE -ne 0) {
               Write-Error "Tailscale connection failed."
               exit 1
           }
 
-          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
 
@@ -119,15 +115,25 @@ jobs:
           Write-Host "Tailscale IP: $tsIP"
 
       # ==========================================
-      # 5. DOWNLOAD PCYBER APPLICATION
+      # 5. CREATE APPLICATION DIRECTORY
+      # ==========================================
+      - name: Create PCYBER Application Directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "C:\PCYBER" -Force | Out-Null
+
+          Write-Host "PCYBER application directory created."
+
+      # ==========================================
+      # 6. DOWNLOAD PCYBER APPLICATION
       # ==========================================
       - name: Download PCYBER Application
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $downloadUrl = "https://github.com/pcyberict/mcmchanger/releases/download/v1.0/mac_changer.exe"
-          $downloadPath = "C:\mac_changer.exe"
+          $downloadUrl = "https://github.com/pcyberict/pcyber-rdp-apps/releases/download/v1.0/pbot.exe"
+          $downloadPath = "C:\PCYBER\pbot.exe"
 
           Write-Host "Downloading PCYBER application..."
 
@@ -142,7 +148,7 @@ jobs:
           Write-Host "Downloaded size: $([math]::Round($fileSize / 1MB, 2)) MB"
 
           if ($fileSize -lt 900MB) {
-              throw "Downloaded file is too small."
+              throw "Downloaded PCYBER application is too small."
           }
 
           $actualHash = (Get-FileHash -Path $downloadPath -Algorithm SHA256).Hash.ToLower()
@@ -153,10 +159,56 @@ jobs:
               throw "PCYBER application SHA256 verification failed."
           }
 
-          Write-Host "PCYBER application downloaded and verified."
+          Write-Host "PCYBER application downloaded and verified successfully."
 
       # ==========================================
-      # 6. VERIFY RDP ACCESSIBILITY
+      # 7. DOWNLOAD MAC CHANGER APPLICATION
+      # ==========================================
+      - name: Download MAC Changer Application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $downloadUrl = "https://github.com/pcyberict/mcmchanger/releases/download/v1.0/mac_changer.exe"
+          $downloadPath = "C:\PCYBER\mac_changer.exe"
+
+          Write-Host "Downloading MAC Changer application..."
+
+          Invoke-WebRequest `
+            -Uri $downloadUrl `
+            -OutFile $downloadPath
+
+          if (-not (Test-Path $downloadPath)) {
+              throw "MAC Changer download failed."
+          }
+
+          $file = Get-Item $downloadPath
+
+          if ($file.Length -lt 10KB) {
+              throw "MAC Changer executable is too small or incomplete."
+          }
+
+          # Verify Windows executable signature header
+          $stream = [System.IO.File]::OpenRead($downloadPath)
+
+          try {
+              $header = New-Object byte[] 2
+              [void]$stream.Read($header, 0, 2)
+          }
+          finally {
+              $stream.Dispose()
+          }
+
+          if ($header[0] -ne 0x4D -or $header[1] -ne 0x5A) {
+              throw "Downloaded MAC Changer is not a valid Windows executable."
+          }
+
+          Write-Host "MAC Changer downloaded successfully."
+          Write-Host "File: $downloadPath"
+          Write-Host "Size: $([math]::Round($file.Length / 1MB, 2)) MB"
+
+      # ==========================================
+      # 8. VERIFY RDP ACCESSIBILITY
       # ==========================================
       - name: Verify RDP Accessibility
         shell: pwsh
@@ -176,7 +228,7 @@ jobs:
           Write-Host "TCP connectivity successful!"
 
       # ==========================================
-      # 7. MAINTAIN CONNECTION + WATCH RDP USER
+      # 9. MAINTAIN CONNECTION + WATCH RDP USER
       # ==========================================
       - name: Maintain Connection + Watch RDP User
         shell: pwsh
@@ -186,6 +238,13 @@ jobs:
           Write-Host "Username: RDP"
           Write-Host "Password: $(echo $env:RDP_CREDS)"
           Write-Host "==================`n"
+
+          Write-Host "======================================"
+          Write-Host "INSTALLED APPLICATIONS"
+          Write-Host "======================================"
+          Write-Host "PCYBER App: C:\PCYBER\pbot.exe"
+          Write-Host "MAC Changer: C:\PCYBER\mac_changer.exe"
+          Write-Host "======================================"
 
           $rdpProfile = "C:\Users\RDP"
 
@@ -211,7 +270,6 @@ jobs:
 
                       Write-Host "Downloads.bat copied to $downloadPath"
 
-                      # Run the batch file for the first time
                       cmd /c $downloadPath
 
                       Write-Host "Downloads.bat executed successfully"
@@ -229,7 +287,7 @@ jobs:
               }
           }
 
-          # Keep runner alive for the remaining workflow duration
+          # Keep runner alive
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
