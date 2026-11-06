@@ -1,0 +1,409 @@
+
+name: win 11 + tailscale + Download.bat script
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      # ==========================================
+      # 1. CONFIGURE WINDOWS RDP
+      # ==========================================
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      # ==========================================
+      # 2. CREATE RDP USER
+      # ==========================================
+      - name: Create RDP User with Fixed Password
+        shell: powershell
+        run: |
+          $password = "MR.English2008"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+          Write-Host "RDP user created successfully."
+
+      # ==========================================
+      # 3. INSTALL TAILSCALE
+      # ==========================================
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+
+          Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
+            -Wait
+
+          Remove-Item $installerPath -Force
+
+      # ==========================================
+      # 4. CONNECT TAILSCALE
+      # ==========================================
+      - name: Establish Tailscale Connection
+        shell: powershell
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          $tsIP = $null
+          $retries = 0
+
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      # ==========================================
+      # 5. VERIFY RDP CONNECTION
+      # ==========================================
+      - name: Verify RDP Accessibility
+        shell: powershell
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+
+          Write-Host "TCP connectivity successful!"
+
+      # ==========================================
+      # 6. WAIT FOR RDP PROFILE AND INSTALL FILES
+      # ==========================================
+      - name: Download PCYBER Apps and Extract ZIP Files
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $rdpProfile = "C:\Users\RDP"
+          $desktop = "$rdpProfile\Desktop"
+          $downloadFolder = "C:\PCYBER"
+
+          Write-Host "Waiting for the RDP user profile..."
+
+          while (-not (Test-Path $rdpProfile)) {
+              Write-Host "[$(Get-Date)] Waiting for RDP profile..."
+              Start-Sleep -Seconds 15
+          }
+
+          New-Item -ItemType Directory -Path $desktop -Force | Out-Null
+          New-Item -ItemType Directory -Path $downloadFolder -Force | Out-Null
+
+          Write-Host "RDP Desktop is ready: $desktop"
+
+          # ==========================================
+          # DOWNLOAD PBOT.EXE
+          # ==========================================
+          Write-Host "Downloading pbot.exe..."
+
+          $pbotUrl = "https://github.com/pcyberict/pcyber-rdp-apps/releases/download/v1.0/pbot.exe"
+          $pbotPath = Join-Path $desktop "pbot.exe"
+
+          Invoke-WebRequest -Uri $pbotUrl -OutFile $pbotPath
+
+          $expectedHash = "32b69e5102b90d77d521cdd8404511ad1dc031a77c450cf5c80811bc0164cee8"
+          $actualHash = (Get-FileHash -Path $pbotPath -Algorithm SHA256).Hash.ToLower()
+
+          if ($actualHash -ne $expectedHash) {
+              throw "pbot.exe SHA256 verification failed."
+          }
+
+          Write-Host "pbot.exe downloaded and verified."
+
+          # ==========================================
+          # DOWNLOAD MAC CHANGER
+          # ==========================================
+          Write-Host "Downloading mac_changer.exe..."
+
+          $macUrl = "https://github.com/pcyberict/mcmchanger/releases/download/v1.0/mac_changer.exe"
+          $macPath = Join-Path $desktop "mac_changer.exe"
+
+          Invoke-WebRequest -Uri $macUrl -OutFile $macPath
+
+          $macHeader = [System.IO.File]::ReadAllBytes($macPath)[0..1]
+
+          if ($macHeader[0] -ne 0x4D -or $macHeader[1] -ne 0x5A) {
+              throw "mac_changer.exe does not have a valid Windows executable header."
+          }
+
+          Write-Host "mac_changer.exe downloaded successfully."
+
+          # ==========================================
+          # ZIP EXTRACTION FUNCTION
+          # STRIPS ONE COMMON TOP-LEVEL FOLDER
+          # ==========================================
+          Add-Type -AssemblyName System.IO.Compression
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          function Expand-ZipToDesktopRoot {
+              param (
+                  [Parameter(Mandatory = $true)]
+                  [string]$ZipPath,
+
+                  [Parameter(Mandatory = $true)]
+                  [string]$Destination
+              )
+
+              Write-Host "Extracting: $ZipPath"
+
+              $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+
+              try {
+                  $entries = @(
+                      $zip.Entries | Where-Object {
+                          -not [string]::IsNullOrWhiteSpace($_.FullName)
+                      }
+                  )
+
+                  $files = @(
+                      $entries | Where-Object {
+                          -not ($_.FullName.EndsWith("/") -or $_.FullName.EndsWith("\"))
+                      }
+                  )
+
+                  # Detect whether all files share one wrapper directory.
+                  $commonRoot = $null
+                  $canStripRoot = ($files.Count -gt 0)
+
+                  foreach ($file in $files) {
+                      $normalized = $file.FullName.Replace('\', '/')
+
+                      if ($normalized -notmatch '^([^/]+)/.+$') {
+                          $canStripRoot = $false
+                          break
+                      }
+
+                      $topFolder = $Matches[1]
+
+                      if ($null -eq $commonRoot) {
+                          $commonRoot = $topFolder
+                      }
+                      elseif ($commonRoot -ne $topFolder) {
+                          $canStripRoot = $false
+                          break
+                      }
+                  }
+
+                  if ($canStripRoot -and $commonRoot) {
+                      $prefix = $commonRoot + "/"
+                      Write-Host "Detected wrapper folder: $commonRoot"
+                      Write-Host "Removing wrapper folder level during extraction."
+                  }
+                  else {
+                      $prefix = $null
+                      Write-Host "No common wrapper folder detected. Extracting archive paths as-is."
+                  }
+
+                  $destinationRoot = [System.IO.Path]::GetFullPath($Destination).TrimEnd('\') + '\'
+
+                  foreach ($entry in $entries) {
+                      $entryName = $entry.FullName.Replace('\', '/')
+
+                      # Remove exactly one common top-level directory.
+                      if ($canStripRoot) {
+                          if ($entryName.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                              $entryName = $entryName.Substring($prefix.Length)
+                          }
+                          else {
+                              continue
+                          }
+                      }
+
+                      if ([string]::IsNullOrWhiteSpace($entryName)) {
+                          continue
+                      }
+
+                      # Reject unsafe absolute paths and traversal entries.
+                      if ($entryName.StartsWith("/") -or $entryName -match '^[A-Za-z]:') {
+                          throw "Unsafe ZIP entry detected: $($entry.FullName)"
+                      }
+
+                      $segments = $entryName.Split('/')
+
+                      if ($segments -contains "..") {
+                          throw "ZIP path traversal detected: $($entry.FullName)"
+                      }
+
+                      $relativePath = $entryName.Replace('/', [System.IO.Path]::DirectorySeparatorChar)
+
+                      $targetPath = [System.IO.Path]::GetFullPath(
+                          (Join-Path $Destination $relativePath)
+                      )
+
+                      if (-not $targetPath.StartsWith(
+                          $destinationRoot,
+                          [System.StringComparison]::OrdinalIgnoreCase
+                      )) {
+                          throw "ZIP entry attempts to write outside Desktop: $($entry.FullName)"
+                      }
+
+                      # Create directories.
+                      if (
+                          $entry.FullName.EndsWith("/") -or
+                          $entry.FullName.EndsWith("\")
+                      ) {
+                          New-Item -ItemType Directory -Path $targetPath -Force | Out-Null
+                          continue
+                      }
+
+                      $parent = Split-Path -Parent $targetPath
+
+                      New-Item -ItemType Directory -Path $parent -Force | Out-Null
+
+                      $inputStream = $entry.Open()
+                      $outputStream = [System.IO.File]::Create($targetPath)
+
+                      try {
+                          $inputStream.CopyTo($outputStream)
+                      }
+                      finally {
+                          $outputStream.Dispose()
+                          $inputStream.Dispose()
+                      }
+                  }
+
+                  Write-Host "Extraction completed: $ZipPath"
+              }
+              finally {
+                  $zip.Dispose()
+              }
+          }
+
+          # ==========================================
+          # DOWNLOAD PCYBER-TWIST.5.ZIP
+          # ==========================================
+          $twistUrl = "https://github.com/pcyberict/mcmchanger/releases/download/v1.0/pcyber-twist.5.zip"
+          $twistZip = Join-Path $downloadFolder "pcyber-twist.5.zip"
+
+          Write-Host "Downloading pcyber-twist.5.zip..."
+
+          Invoke-WebRequest -Uri $twistUrl -OutFile $twistZip
+
+          Expand-ZipToDesktopRoot -ZipPath $twistZip -Destination $desktop
+
+          # ==========================================
+          # DOWNLOAD CRX.BUILD.ZIP
+          # ==========================================
+          $crxUrl = "https://github.com/pcyberict/mcmchanger/releases/download/v1.0/crx.build.zip"
+          $crxZip = Join-Path $downloadFolder "crx.build.zip"
+
+          Write-Host "Downloading crx.build.zip..."
+
+          Invoke-WebRequest -Uri $crxUrl -OutFile $crxZip
+
+          Expand-ZipToDesktopRoot -ZipPath $crxZip -Destination $desktop
+
+          # ==========================================
+          # VERIFY DESKTOP CONTENTS
+          # ==========================================
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "PCYBER DOWNLOADS COMPLETED"
+          Write-Host "=========================================="
+
+          Get-ChildItem -Path $desktop -Force |
+              Select-Object Mode, Name, Length |
+              Format-Table -AutoSize
+
+          Write-Host "All files extracted into the Desktop root."
+
+      # ==========================================
+      # 7. DOWNLOAD AND RUN DOWNLOADS.BAT
+      # ==========================================
+      - name: Run Downloads.bat and Maintain RDP
+        shell: powershell
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+
+          $rdpProfile = "C:\Users\RDP"
+          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+
+          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+          $downloadPath = "$startupPath\Downloads.bat"
+
+          while ($true) {
+              if (Test-Path $rdpProfile) {
+                  try {
+                      if (-not (Test-Path $startupPath)) {
+                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
+                      }
+
+                      Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
+
+                      Write-Host "Downloads.bat copied to $downloadPath"
+
+                      cmd /c $downloadPath
+
+                      Write-Host "Downloads.bat executed successfully"
+                      break
+                  }
+                  catch {
+                      Write-Host "Error copying or executing Downloads.bat: $($_.Exception.Message)"
+                      break
+                  }
+              }
+              else {
+                  Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
+                  Start-Sleep -Seconds 30
+              }
+          }
+
+          # ==========================================
+          # KEEP RDP SESSION ALIVE
+          # ==========================================
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
