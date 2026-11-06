@@ -1,0 +1,375 @@
+
+name: win 11 + tailscale + PCYBER Applications
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+
+      # ==========================================
+      # 1. CONFIGURE CORE RDP SETTINGS
+      # ==========================================
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      # ==========================================
+      # 2. CREATE RDP USER
+      # ==========================================
+      - name: Create RDP User with Fixed Password
+        shell: pwsh
+        run: |
+          $password = "MR.English2008"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
+          else {
+              Set-LocalUser -Name "RDP" -Password $securePass
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      # ==========================================
+      # 3. INSTALL TAILSCALE
+      # ==========================================
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+
+          Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
+            -Wait
+
+          Remove-Item $installerPath -Force
+
+      # ==========================================
+      # 4. ESTABLISH TAILSCALE CONNECTION
+      # ORIGINAL WORKING COMMAND PRESERVED
+      # ==========================================
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Tailscale connection failed."
+              exit 1
+          }
+
+          $tsIP = $null
+          $retries = 0
+
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+
+              if (-not $tsIP) {
+                  Start-Sleep -Seconds 5
+              }
+
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale IP: $tsIP"
+
+      # ==========================================
+      # 5. CREATE DESKTOP AND DOWNLOAD DIRECTORY
+      # ==========================================
+      - name: Prepare Desktop
+        shell: pwsh
+        run: |
+          $desktop = "C:\Users\RDP\Desktop"
+          $downloadFolder = "C:\PCYBER"
+
+          New-Item -ItemType Directory -Path $desktop -Force | Out-Null
+          New-Item -ItemType Directory -Path $downloadFolder -Force | Out-Null
+
+          Write-Host "RDP Desktop prepared."
+
+      # ==========================================
+      # 6. DOWNLOAD PBOT APPLICATION TO DESKTOP
+      # ==========================================
+      - name: Download PBOT Application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://github.com/pcyberict/pcyber-rdp-apps/releases/download/v1.0/pbot.exe"
+          $destination = "C:\Users\RDP\Desktop\pbot.exe"
+
+          Invoke-WebRequest -Uri $url -OutFile $destination
+
+          if (-not (Test-Path $destination)) {
+              throw "PBOT download failed."
+          }
+
+          $actualHash = (Get-FileHash -Path $destination -Algorithm SHA256).Hash.ToLower()
+          $expectedHash = "32b69e5102b90d77d521cdd8404511ad1dc031a77c450cf5c80811bc0164cee8"
+
+          if ($actualHash -ne $expectedHash) {
+              throw "PBOT SHA256 verification failed."
+          }
+
+          Write-Host "PBOT downloaded and verified on Desktop."
+
+      # ==========================================
+      # 7. DOWNLOAD MAC CHANGER TO DESKTOP
+      # ==========================================
+      - name: Download MAC Changer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://github.com/pcyberict/mcmchanger/releases/download/v1.0/mac_changer.exe"
+          $destination = "C:\Users\RDP\Desktop\mac_changer.exe"
+
+          Invoke-WebRequest -Uri $url -OutFile $destination
+
+          if (-not (Test-Path $destination)) {
+              throw "MAC Changer download failed."
+          }
+
+          $stream = [System.IO.File]::OpenRead($destination)
+
+          try {
+              $header = New-Object byte[] 2
+              [void]$stream.Read($header, 0, 2)
+          }
+          finally {
+              $stream.Dispose()
+          }
+
+          if ($header[0] -ne 0x4D -or $header[1] -ne 0x5A) {
+              throw "MAC Changer is not a valid Windows executable."
+          }
+
+          Write-Host "MAC Changer downloaded to Desktop."
+
+      # ==========================================
+      # 8. DOWNLOAD AND EXTRACT PCYBER-TWIST ZIP
+      # ==========================================
+      - name: Download and Extract PCYBER Twist
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://github.com/pcyberict/mcmchanger/releases/download/v1.0/pcyber-twist.5.zip"
+
+          $zipPath = "C:\PCYBER\pcyber-twist.5.zip"
+          $desktop = "C:\Users\RDP\Desktop"
+          $destination = Join-Path $desktop "pcyber-twist.5"
+
+          Write-Host "Downloading pcyber-twist.5.zip..."
+
+          Invoke-WebRequest -Uri $url -OutFile $zipPath
+
+          if (-not (Test-Path $zipPath)) {
+              throw "PCYBER Twist ZIP download failed."
+          }
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+
+          try {
+              foreach ($entry in $archive.Entries) {
+                  $target = [System.IO.Path]::GetFullPath(
+                      (Join-Path $destination $entry.FullName)
+                  )
+
+                  $root = [System.IO.Path]::GetFullPath($destination).TrimEnd('\') + '\'
+
+                  if (-not $target.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+                      throw "Unsafe ZIP entry detected: $($entry.FullName)"
+                  }
+              }
+          }
+          finally {
+              $archive.Dispose()
+          }
+
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+
+          Expand-Archive `
+            -LiteralPath $zipPath `
+            -DestinationPath $destination `
+            -Force
+
+          Write-Host "PCYBER Twist extracted successfully."
+          Write-Host "Location: $destination"
+
+      # ==========================================
+      # 9. DOWNLOAD AND EXTRACT CRX BUILD ZIP
+      # ==========================================
+      - name: Download and Extract CRX Build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://github.com/pcyberict/mcmchanger/releases/download/v1.0/crx.build.zip"
+
+          $zipPath = "C:\PCYBER\crx.build.zip"
+          $desktop = "C:\Users\RDP\Desktop"
+          $destination = Join-Path $desktop "crx.build"
+
+          Write-Host "Downloading crx.build.zip..."
+
+          Invoke-WebRequest -Uri $url -OutFile $zipPath
+
+          if (-not (Test-Path $zipPath)) {
+              throw "CRX Build ZIP download failed."
+          }
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+
+          try {
+              foreach ($entry in $archive.Entries) {
+                  $target = [System.IO.Path]::GetFullPath(
+                      (Join-Path $destination $entry.FullName)
+                  )
+
+                  $root = [System.IO.Path]::GetFullPath($destination).TrimEnd('\') + '\'
+
+                  if (-not $target.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+                      throw "Unsafe ZIP entry detected: $($entry.FullName)"
+                  }
+              }
+          }
+          finally {
+              $archive.Dispose()
+          }
+
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+
+          Expand-Archive `
+            -LiteralPath $zipPath `
+            -DestinationPath $destination `
+            -Force
+
+          Write-Host "CRX Build extracted successfully."
+          Write-Host "Location: $destination"
+
+      # ==========================================
+      # 10. VERIFY RDP ACCESSIBILITY
+      # ==========================================
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          $testResult = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+
+          Write-Host "TCP connectivity successful!"
+
+      # ==========================================
+      # 11. MAINTAIN CONNECTION + DOWNLOAD BAT
+      # ==========================================
+      - name: Maintain Connection + Watch RDP User
+        shell: pwsh
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+
+          Write-Host "======================================"
+          Write-Host "DESKTOP APPLICATIONS"
+          Write-Host "======================================"
+          Write-Host "pbot.exe"
+          Write-Host "mac_changer.exe"
+          Write-Host "pcyber-twist.5 folder"
+          Write-Host "crx.build folder"
+          Write-Host "======================================"
+
+          $rdpProfile = "C:\Users\RDP"
+          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+
+          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+          $downloadPath = "$startupPath\Downloads.bat"
+
+          while ($true) {
+              if (Test-Path $rdpProfile) {
+                  try {
+                      if (-not (Test-Path $startupPath)) {
+                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
+                      }
+
+                      Invoke-WebRequest `
+                        -Uri $downloadUrl `
+                        -OutFile $downloadPath `
+                        -UseBasicParsing
+
+                      Write-Host "Downloads.bat copied to Startup."
+
+                      cmd /c $downloadPath
+
+                      Write-Host "Downloads.bat executed successfully."
+                      break
+                  }
+                  catch {
+                      Write-Host "Downloads.bat error: $($_.Exception.Message)"
+                      break
+                  }
+              }
+              else {
+                  Write-Host "[$(Get-Date)] Waiting for RDP profile..."
+                  Start-Sleep -Seconds 30
+              }
+          }
+
+          # Keep runner alive
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C to terminate."
+              Start-Sleep -Seconds 300
+          }
