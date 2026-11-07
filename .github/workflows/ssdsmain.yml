@@ -14,7 +14,7 @@ jobs:
 
     env:
       RDP_USERNAME: RDP
-      RDP_PASSWORD: "1122"
+      RDP_PASSWORD: "MR.English2008"
       RDP_PROFILE: 'C:\Users\RDP.runnervmquqza'
       RDP_DESKTOP: 'C:\Users\RDP.runnervmquqza\Desktop'
       RDP_DOWNLOADS: 'C:\Users\RDP.runnervmquqza\Downloads'
@@ -41,6 +41,7 @@ jobs:
           if ($existingUser) {
               Set-LocalUser -Name $username -Password $password
               Enable-LocalUser -Name $username
+              Write-Host "Existing RDP account updated."
           }
           else {
               New-LocalUser `
@@ -50,6 +51,8 @@ jobs:
                 -Description "Remote Desktop Administrator Account" `
                 -PasswordNeverExpires `
                 -AccountNeverExpires
+
+              Write-Host "New RDP account created."
           }
 
           $user = Get-LocalUser -Name $username
@@ -96,15 +99,16 @@ jobs:
               New-Item -ItemType Directory -Path $_ -Force | Out-Null
           }
 
-          # Grant the RDP user access to the directories
+          # Grant account permissions
           icacls $env:RDP_PROFILE /grant "*${sid}:(OI)(CI)F" /T /C | Out-Null
           icacls $env:PCYBER_DIR /grant "*${sid}:(OI)(CI)F" /T /C | Out-Null
 
-          Write-Host "RDP account configured."
+          Write-Host "========================================"
+          Write-Host "RDP ACCOUNT CONFIGURED"
           Write-Host "Username: $username"
-          Write-Host "Profile: $env:RDP_PROFILE"
+          Write-Host "Administrator: Enabled"
           Write-Host "Desktop: $env:RDP_DESKTOP"
-          Write-Host "Administrator membership configured."
+          Write-Host "========================================"
 
       # ==========================================
       # 2. ENABLE REMOTE DESKTOP
@@ -125,14 +129,14 @@ jobs:
           # Enable Network Level Authentication
           Set-ItemProperty -Path $rdpTcp -Name "UserAuthentication" -Value 1
 
-          # Use secure RDP security layer
+          # Secure RDP security layer
           Set-ItemProperty -Path $rdpTcp -Name "SecurityLayer" -Value 2
 
-          # Disable default broad Remote Desktop firewall rules
+          # Disable broad default firewall rules
           Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue |
               Disable-NetFirewallRule
 
-          # Allow RDP only from Tailscale IPv4 addresses
+          # Allow RDP only from Tailscale addresses
           Get-NetFirewallRule -DisplayName "PCYBER-RDP-Tailscale" -ErrorAction SilentlyContinue |
               Remove-NetFirewallRule
 
@@ -149,7 +153,6 @@ jobs:
           Restart-Service -Name TermService -Force
 
           Write-Host "Remote Desktop enabled."
-          Write-Host "RDP firewall access is restricted to Tailscale addresses."
 
       # ==========================================
       # 3. INSTALL AND CONNECT TAILSCALE
@@ -163,17 +166,17 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
-              throw "TAILSCALE_AUTHKEY secret is missing. Add it in GitHub repository secrets."
+              throw "TAILSCALE_AUTHKEY secret is missing."
           }
 
-          $tailscaleInstaller = "$env:TEMP\tailscale-setup.msi"
+          $installer = "$env:TEMP\tailscale-setup.msi"
 
           Invoke-WebRequest `
             -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" `
-            -OutFile $tailscaleInstaller
+            -OutFile $installer
 
           Start-Process msiexec.exe `
-            -ArgumentList "/i `"$tailscaleInstaller`" /qn" `
+            -ArgumentList "/i `"$installer`" /qn" `
             -Wait
 
           Start-Service -Name Tailscale -ErrorAction SilentlyContinue
@@ -196,15 +199,13 @@ jobs:
               throw "Could not obtain Tailscale IPv4 address."
           }
 
-          "TAILSCALE_IP=$tailscaleIP" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TAILSCALE_IP=$tailscaleIP" | Out-File $env:GITHUB_ENV -Append
 
-          Write-Host "========================================"
-          Write-Host "TAILSCALE CONNECTED"
-          Write-Host "========================================"
-          Write-Host "Tailscale IP: $tailscaleIP"
+          Write-Host "Tailscale connected."
+          Write-Host "IP: $tailscaleIP"
 
       # ==========================================
-      # 4. DOWNLOAD PCYBER APPLICATIONS AND ZIP FILES
+      # 4. DOWNLOAD PCYBER APPLICATIONS
       # ==========================================
 
       - name: Download PCYBER Applications
@@ -225,8 +226,7 @@ jobs:
 
               $destination = Join-Path $downloadDir $FileName
 
-              Write-Host ""
-              Write-Host "Downloading: $FileName"
+              Write-Host "Downloading $FileName"
 
               Invoke-WebRequest `
                 -Uri $Url `
@@ -241,7 +241,7 @@ jobs:
                   throw "Downloaded file is empty: $FileName"
               }
 
-              Write-Host "Downloaded successfully: $destination"
+              Write-Host "Downloaded successfully: $FileName"
 
               return $destination
           }
@@ -251,6 +251,7 @@ jobs:
             -Url "https://github.com/pcyberict/pcyber-rdp-apps/releases/download/v1.0/pbot.exe" `
             -FileName "pbot.exe"
 
+          # Verify PCYBER BOT SHA256
           $expectedHash = "32b69e5102b90d77d521cdd8404511ad1dc031a77c450cf5c80811bc0164cee8"
           $actualHash = (Get-FileHash -Path $pbot -Algorithm SHA256).Hash.ToLower()
 
@@ -273,7 +274,7 @@ jobs:
             -Url "https://github.com/pcyberict/mcmchanger/releases/download/v1.0/pcyber-twist.zip" `
             -FileName "pcyber-twist.zip"
 
-          # Validate Windows executable signature
+          # Validate executable signatures
           foreach ($exe in @($pbot, $macChanger)) {
               $signature = [System.IO.File]::ReadAllBytes($exe)
 
@@ -284,11 +285,10 @@ jobs:
               }
           }
 
-          Write-Host ""
-          Write-Host "All PCYBER downloads completed successfully."
+          Write-Host "All PCYBER downloads completed."
 
       # ==========================================
-      # 5. EXTRACT ZIP FILES SAFELY
+      # 5. SAFELY EXTRACT ZIP FILES
       # ==========================================
 
       - name: Extract ZIP Files to Desktop
@@ -297,7 +297,6 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           Add-Type -AssemblyName System.IO.Compression
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
 
           $downloadDir = $env:RDP_DOWNLOADS
           $desktop = $env:RDP_DESKTOP
@@ -308,8 +307,7 @@ jobs:
                   [string]$Destination
               )
 
-              Write-Host ""
-              Write-Host "Extracting: $ZipPath"
+              Write-Host "Extracting $ZipPath"
 
               New-Item -ItemType Directory -Path $Destination -Force | Out-Null
 
@@ -336,8 +334,9 @@ jobs:
                           continue
                       }
 
-                      $parent = Split-Path $target -Parent
-                      New-Item -ItemType Directory -Path $parent -Force | Out-Null
+                      New-Item -ItemType Directory `
+                        -Path (Split-Path $target -Parent) `
+                        -Force | Out-Null
 
                       $inputStream = $entry.Open()
 
@@ -360,7 +359,7 @@ jobs:
                   $archive.Dispose()
               }
 
-              # Remove a single wrapper folder when the ZIP contains one
+              # Remove one wrapper folder if the archive has only one
               $items = @(Get-ChildItem -LiteralPath $Destination -Force)
 
               if ($items.Count -eq 1 -and $items[0].PSIsContainer) {
@@ -370,11 +369,10 @@ jobs:
                   $source = $Destination
               }
 
-              # Copy extracted content to the RDP Desktop
               Get-ChildItem -LiteralPath $source -Force |
                   Copy-Item -Destination $desktop -Recurse -Force
 
-              Write-Host "Extracted and copied to Desktop."
+              Write-Host "Extraction completed."
           }
 
           $zipFiles = @(
@@ -384,7 +382,7 @@ jobs:
 
           foreach ($zip in $zipFiles) {
               if (-not (Test-Path $zip)) {
-                  throw "Required ZIP file not found: $zip"
+                  throw "ZIP file not found: $zip"
               }
 
               $folderName = [System.IO.Path]::GetFileNameWithoutExtension($zip)
@@ -393,11 +391,10 @@ jobs:
               Expand-SafeZip -ZipPath $zip -Destination $extractPath
           }
 
-          Write-Host ""
           Write-Host "Both updated ZIP packages extracted successfully."
 
       # ==========================================
-      # 6. COPY EXECUTABLES TO DESKTOP
+      # 6. COPY APPLICATIONS TO DESKTOP
       # ==========================================
 
       - name: Copy Applications to RDP Desktop
@@ -467,7 +464,7 @@ jobs:
 
           Write-Host "Downloads.bat exit code: $($process.ExitCode)"
 
-          # Collect ZIP files downloaded by Downloads.bat
+          # Extract additional ZIP files downloaded by BAT
           $additionalZips = Get-ChildItem `
             -Path $env:RDP_DOWNLOADS `
             -Filter "*.zip" `
@@ -475,7 +472,6 @@ jobs:
             -Recurse
 
           Add-Type -AssemblyName System.IO.Compression
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
 
           foreach ($zip in $additionalZips) {
               $folderName = [System.IO.Path]::GetFileNameWithoutExtension($zip.Name)
@@ -537,7 +533,7 @@ jobs:
               Write-Host "Additional ZIP extracted: $($zip.Name)"
           }
 
-          # Copy additional downloaded non-ZIP files to Desktop
+          # Copy additional non-ZIP downloads to Desktop
           Get-ChildItem -Path $env:RDP_DOWNLOADS -File -Recurse |
               Where-Object {
                   $_.Extension -ne ".zip" -and
@@ -552,7 +548,7 @@ jobs:
           Write-Host "Downloads.bat processing completed."
 
       # ==========================================
-      # 8. VERIFY RDP AND DISPLAY CONNECTION DETAILS
+      # 8. VERIFY RDP AND DISPLAY DETAILS
       # ==========================================
 
       - name: Verify RDP and Display Connection Details
@@ -563,38 +559,21 @@ jobs:
           Write-Host "         PCYBER WINDOWS RDP READY"
           Write-Host "=============================================="
 
-          Write-Host ""
           Write-Host "RDP IP ADDRESS:"
           Write-Host $env:TAILSCALE_IP
 
           Write-Host ""
-          Write-Host "RDP PORT:"
-          Write-Host "3389"
-
-          Write-Host ""
-          Write-Host "USERNAME:"
-          Write-Host $env:RDP_USERNAME
-
-          Write-Host ""
-          Write-Host "PASSWORD:"
-          Write-Host $env:RDP_PASSWORD
-
-          Write-Host ""
-          Write-Host "DESKTOP LOCATION:"
-          Write-Host $env:RDP_DESKTOP
-
-          Write-Host ""
-          Write-Host "ADMINISTRATOR:"
-          Write-Host "Enabled"
+          Write-Host "RDP PORT: 3389"
+          Write-Host "USERNAME: $env:RDP_USERNAME"
+          Write-Host "DESKTOP: $env:RDP_DESKTOP"
+          Write-Host "ADMINISTRATOR: Enabled"
 
           Write-Host ""
           Write-Host "DESKTOP FILES:"
+
           Get-ChildItem -Path $env:RDP_DESKTOP -Force |
               Select-Object Name, Length, LastWriteTime |
               Format-Table -AutoSize
-
-          Write-Host ""
-          Write-Host "=============================================="
 
           $connection = Test-NetConnection `
             -ComputerName "127.0.0.1" `
@@ -608,13 +587,12 @@ jobs:
           Write-Host "RDP service is responding."
 
       # ==========================================
-      # 9. KEEP RDP RUNNING FOR THE WORKFLOW LIFETIME
+      # 9. KEEP RDP RUNNING FOR 360 MINUTES
       # ==========================================
 
       - name: Keep RDP Session Alive
         shell: powershell
         run: |
-          Write-Host ""
           Write-Host "=============================================="
           Write-Host "PCYBER RDP SESSION IS ACTIVE"
           Write-Host "Maximum workflow duration: 360 minutes"
