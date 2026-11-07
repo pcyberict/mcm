@@ -1,0 +1,492 @@
+
+name: PCYBER Windows RDP + Tailscale + Downloads
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+
+      # =========================================================
+      # 1. CONFIGURE WINDOWS REMOTE DESKTOP
+      # =========================================================
+      - name: Configure RDP and Windows Firewall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Configuring Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          # Enable Network Level Authentication
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          # Use TLS security layer
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "SecurityLayer" `
+            -Value 2
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          # Remove previous custom firewall rule if present
+          Get-NetFirewallRule -DisplayName "PCYBER-RDP-Tailscale" `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          # Permit RDP only through Tailscale IPv4 addresses
+          New-NetFirewallRule `
+            -DisplayName "PCYBER-RDP-Tailscale" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any
+
+          Write-Host "RDP configured. Firewall restricted to Tailscale."
+
+      # =========================================================
+      # 2. CREATE RDP USER AND ASSIGN ADMINISTRATOR PRIVILEGES
+      # =========================================================
+      - name: Create RDP Administrator Account
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $username = "RDP"
+          $password = "MR.English2008"
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+
+          Write-Host "Creating or updating RDP account..."
+
+          $existingUser = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+
+          if ($existingUser) {
+              Set-LocalUser -Name $username -Password $securePassword
+              Enable-LocalUser -Name $username
+          }
+          else {
+              New-LocalUser `
+                -Name $username `
+                -Password $securePassword `
+                -FullName "PCYBER Remote Desktop Administrator" `
+                -Description "PCYBER RDP administrator account" `
+                -PasswordNeverExpires
+          }
+
+          # Resolve local groups by their well-known SIDs
+          $administratorsGroup = Get-LocalGroup -SID "S-1-5-32-544"
+          $remoteDesktopGroup = Get-LocalGroup -SID "S-1-5-32-555"
+
+          # Add RDP to local Administrators
+          if (-not (Get-LocalGroupMember -Group $administratorsGroup -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '\\RDP$' })) {
+
+              Add-LocalGroupMember `
+                -Group $administratorsGroup `
+                -Member $username
+          }
+
+          # Add RDP to Remote Desktop Users
+          if (-not (Get-LocalGroupMember -Group $remoteDesktopGroup -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '\\RDP$' })) {
+
+              Add-LocalGroupMember `
+                -Group $remoteDesktopGroup `
+                -Member $username
+          }
+
+          # Configure the requested Windows profile directory
+          $rdpProfile = "C:\Users\RDP"
+
+          New-Item -ItemType Directory -Path $rdpProfile -Force | Out-Null
+
+          $profileList = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
+
+          $userSid = (Get-LocalUser -Name $username).SID.Value
+          $userProfileKey = Join-Path $profileList $userSid
+
+          New-Item -Path $userProfileKey -Force | Out-Null
+
+          Set-ItemProperty `
+            -Path $userProfileKey `
+            -Name "ProfileImagePath" `
+            -Value $rdpProfile
+
+          # Give the account full control over its profile folder
+          $acl = Get-Acl $rdpProfile
+          $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+              $username,
+              "FullControl",
+              "ContainerInherit,ObjectInherit",
+              "None",
+              "Allow"
+          )
+
+          $acl.SetAccessRule($accessRule)
+          Set-Acl -Path $rdpProfile -AclObject $acl
+
+          # Prepare Desktop and Downloads
+          New-Item -ItemType Directory -Force -Path "$rdpProfile\Desktop" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$rdpProfile\Downloads" | Out-Null
+
+          Write-Host "RDP account configured."
+
+          Write-Host "Administrator group membership:"
+          Get-LocalGroupMember -Group $administratorsGroup |
+            Format-Table Name, ObjectClass, PrincipalSource
+
+          Write-Host "Remote Desktop Users membership:"
+          Get-LocalGroupMember -Group $remoteDesktopGroup |
+            Format-Table Name, ObjectClass, PrincipalSource
+
+      # =========================================================
+      # 3. INSTALL TAILSCALE
+      # =========================================================
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installer = "$env:TEMP\tailscale-setup.msi"
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" `
+            -OutFile $installer
+
+          Start-Process msiexec.exe `
+            -ArgumentList "/i `"$installer`" /qn /norestart" `
+            -Wait
+
+          $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscaleExe)) {
+              throw "Tailscale installation failed."
+          }
+
+          Write-Host "Tailscale installed successfully."
+
+      # =========================================================
+      # 4. CONNECT TAILSCALE USING THE ORIGINAL AUTHKEY METHOD
+      # =========================================================
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+              throw "TAILSCALE_AUTHKEY secret is missing. Configure it in GitHub repository secrets."
+          }
+
+          $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          & $tailscaleExe up `
+            "--authkey=$env:TAILSCALE_AUTHKEY" `
+            "--hostname=gh-runner-$env:GITHUB_RUN_ID"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale connection failed."
+          }
+
+          $tsIP = $null
+          $retries = 0
+
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & $tailscaleExe ip -4 |
+                Select-Object -First 1
+
+              if (-not $tsIP) {
+                  Start-Sleep -Seconds 5
+              }
+
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              throw "Tailscale IP not assigned. Exiting."
+          }
+
+          "TAILSCALE_IP=$tsIP" | Out-File $env:GITHUB_ENV -Append
+
+          Write-Host "======================================"
+          Write-Host "TAILSCALE CONNECTION SUCCESSFUL"
+          Write-Host "RDP TAILSCALE IP: $tsIP"
+          Write-Host "RDP USERNAME: RDP"
+          Write-Host "RDP PORT: 3389"
+          Write-Host "======================================"
+
+      # =========================================================
+      # 5. PREPARE PCYBER DESKTOP AND DOWNLOADS
+      # =========================================================
+      - name: Prepare PCYBER Directories
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $profile = "C:\Users\RDP"
+
+          $desktop = "$profile\Desktop"
+          $downloads = "$profile\Downloads"
+
+          New-Item -ItemType Directory -Force -Path $desktop | Out-Null
+          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+          New-Item -ItemType Directory -Force -Path "C:\PCYBER" | Out-Null
+
+          Write-Host "Profile: $profile"
+          Write-Host "Desktop: $desktop"
+          Write-Host "Downloads: $downloads"
+
+      # =========================================================
+      # 6. DOWNLOAD PBOT.EXE AND VERIFY SHA256
+      # =========================================================
+      - name: Download PCYBER Bot
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://github.com/pcyberict/pcyber-rdp-apps/releases/download/v1.0/pbot.exe"
+          $destination = "C:\Users\RDP\Desktop\pbot.exe"
+
+          Invoke-WebRequest -Uri $url -OutFile $destination
+
+          $expectedHash = "32b69e5102b90d77d521cdd8404511ad1dc031a77c450cf5c80811bc0164cee8"
+
+          $actualHash = (Get-FileHash $destination -Algorithm SHA256).Hash.ToLower()
+
+          if ($actualHash -ne $expectedHash) {
+              Remove-Item $destination -Force
+              throw "pbot.exe SHA256 verification failed."
+          }
+
+          Write-Host "pbot.exe downloaded and verified."
+
+      # =========================================================
+      # 7. DOWNLOAD MAC CHANGER
+      # =========================================================
+      - name: Download MAC Changer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://github.com/pcyberict/mcmchanger/releases/download/v1.0/mac_changer.exe"
+          $destination = "C:\Users\RDP\Desktop\mac_changer.exe"
+
+          Invoke-WebRequest -Uri $url -OutFile $destination
+
+          $signature = Get-Content -Path $destination -Encoding Byte -TotalCount 2
+
+          if ($signature.Length -ne 2 -or $signature[0] -ne 0x4D -or $signature[1] -ne 0x5A) {
+              Remove-Item $destination -Force
+              throw "Downloaded mac_changer.exe is not a valid Windows executable."
+          }
+
+          Write-Host "MAC Changer downloaded."
+
+      # =========================================================
+      # 8. DOWNLOAD AND SAFELY EXTRACT ZIP FILES
+      # =========================================================
+      - name: Download and Extract PCYBER ZIP Applications
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $desktop = "C:\Users\RDP\Desktop"
+          $temp = "C:\PCYBER\Downloads"
+
+          New-Item -ItemType Directory -Force -Path $temp | Out-Null
+
+          function Download-And-Extract {
+              param(
+                  [string]$Url,
+                  [string]$ZipName,
+                  [string]$ExtractFolder
+              )
+
+              $zipPath = Join-Path $temp $ZipName
+              $destination = Join-Path $desktop $ExtractFolder
+
+              Write-Host "Downloading $ZipName"
+
+              Invoke-WebRequest -Uri $Url -OutFile $zipPath
+
+              if (-not (Test-Path $zipPath)) {
+                  throw "ZIP download failed: $ZipName"
+              }
+
+              if ((Get-Item $zipPath).Length -lt 100) {
+                  throw "Downloaded ZIP is too small: $ZipName"
+              }
+
+              # Validate archive paths before extraction
+              Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+              $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+
+              try {
+                  $root = [System.IO.Path]::GetFullPath($destination).TrimEnd('\') + '\'
+
+                  foreach ($entry in $archive.Entries) {
+                      $target = [System.IO.Path]::GetFullPath(
+                          [System.IO.Path]::Combine($destination, $entry.FullName)
+                      )
+
+                      if (-not $target.StartsWith(
+                          $root,
+                          [System.StringComparison]::OrdinalIgnoreCase
+                      )) {
+                          throw "Unsafe ZIP entry detected: $($entry.FullName)"
+                      }
+                  }
+              }
+              finally {
+                  $archive.Dispose()
+              }
+
+              New-Item -ItemType Directory -Force -Path $destination | Out-Null
+
+              Expand-Archive `
+                -LiteralPath $zipPath `
+                -DestinationPath $destination `
+                -Force
+
+              Write-Host "Extracted $ZipName to $destination"
+          }
+
+          Download-And-Extract `
+            -Url "https://github.com/pcyberict/mcmchanger/releases/download/v1.0/pcyber-twist.zip" `
+            -ZipName "pcyber-twist.zip" `
+            -ExtractFolder "pcyber-twist"
+
+          Download-And-Extract `
+            -Url "https://github.com/pcyberict/mcmchanger/releases/download/v1.0/crx.build.zip" `
+            -ZipName "crx.build.zip" `
+            -ExtractFolder "crx.build"
+
+      # =========================================================
+      # 9. DOWNLOAD DOWNLOADS.BAT
+      # =========================================================
+      - name: Download PCYBER Downloads Script
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+
+          $downloads = "C:\Users\RDP\Downloads"
+          $startup = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
+
+          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+          New-Item -ItemType Directory -Force -Path $startup | Out-Null
+
+          $batPath = Join-Path $downloads "Downloads.bat"
+
+          Invoke-WebRequest -Uri $url -OutFile $batPath
+
+          if (-not (Test-Path $batPath)) {
+              throw "Downloads.bat download failed."
+          }
+
+          if ((Get-Item $batPath).Length -lt 10) {
+              throw "Downloads.bat appears to be empty or invalid."
+          }
+
+          Copy-Item `
+            -Path $batPath `
+            -Destination (Join-Path $startup "Downloads.bat") `
+            -Force
+
+          Write-Host "Downloads.bat downloaded and added to Startup."
+
+      # =========================================================
+      # 10. VERIFY RDP ADMINISTRATOR ACCESS
+      # =========================================================
+      - name: Verify RDP Administrator Access
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $username = "RDP"
+
+          $administratorsGroup = Get-LocalGroup -SID "S-1-5-32-544"
+          $remoteDesktopGroup = Get-LocalGroup -SID "S-1-5-32-555"
+
+          $adminMember = Get-LocalGroupMember -Group $administratorsGroup |
+            Where-Object { $_.Name -match '\\RDP$' }
+
+          $rdpMember = Get-LocalGroupMember -Group $remoteDesktopGroup |
+            Where-Object { $_.Name -match '\\RDP$' }
+
+          if (-not $adminMember) {
+              throw "RDP is NOT a member of the Administrators group."
+          }
+
+          if (-not $rdpMember) {
+              throw "RDP is NOT a member of Remote Desktop Users."
+          }
+
+          Write-Host "RDP is a local Administrator."
+          Write-Host "RDP is a Remote Desktop User."
+
+          Write-Host "Profile directory:"
+          Write-Host "C:\Users\RDP"
+
+          Write-Host "Checking RDP port..."
+
+          $listener = Get-NetTCPConnection -LocalPort 3389 -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if (-not $listener) {
+              throw "RDP port 3389 is not listening."
+          }
+
+          Write-Host "RDP port 3389 is listening."
+
+          Write-Host "======================================"
+          Write-Host "PCYBER RDP IS READY"
+          Write-Host "IP: $env:TAILSCALE_IP"
+          Write-Host "USERNAME: RDP"
+          Write-Host "PASSWORD: MR.English2008"
+          Write-Host "PROFILE: C:\Users\RDP"
+          Write-Host "ACCESS: LOCAL ADMINISTRATOR"
+          Write-Host "======================================"
+
+      # =========================================================
+      # 11. MAINTAIN RDP SESSION
+      # =========================================================
+      - name: Maintain RDP Session
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "Keeping PCYBER RDP runner alive..."
+
+          $endTime = (Get-Date).AddMinutes(350)
+
+          while ((Get-Date) -lt $endTime) {
+
+              Write-Host "======================================"
+              Write-Host "PCYBER RDP SESSION ACTIVE"
+              Write-Host "TIME: $(Get-Date)"
+              Write-Host "TAILSCALE IP: $env:TAILSCALE_IP"
+              Write-Host "RDP USER: RDP"
+              Write-Host "======================================"
+
+              Start-Sleep -Seconds 300
+          }
+
+          Write-Host "RDP keep-alive period completed."
