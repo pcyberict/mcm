@@ -1,0 +1,592 @@
+
+name: win 11 + tailscale + Download.bat script
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    env:
+      RDP_PROFILE: C:\Users\RDP.runnervmquqza
+      RDP_DESKTOP: C:\Users\RDP.runnervmquqza\Desktop
+      RDP_DOWNLOADS: C:\Users\RDP.runnervmquqza\Downloads
+
+    steps:
+
+      # ==========================================
+      # 1. CONFIGURE WINDOWS RDP
+      # ==========================================
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Enable Network Level Authentication.
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 1 -Force
+
+          # Restrict RDP access to Tailscale addresses.
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          Remove-NetFirewallRule -DisplayName "RDP-Tailscale" `
+            -ErrorAction SilentlyContinue
+
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale" `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Profile Any
+
+          Restart-Service -Name TermService -Force
+
+      # ==========================================
+      # 2. CREATE RDP USER
+      # ==========================================
+      - name: Create RDP User with Full Administrator Privileges
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $username = "RDP"
+          $password = "1122"
+
+          $securePass = ConvertTo-SecureString `
+            $password -AsPlainText -Force
+
+          # Create or update RDP account.
+          $existingUser = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if (-not $existingUser) {
+              New-LocalUser `
+                -Name $username `
+                -Password $securePass `
+                -AccountNeverExpires
+          }
+          else {
+              Set-LocalUser `
+                -Name $username `
+                -Password $securePass
+
+              Enable-LocalUser -Name $username
+          }
+
+          # ======================================
+          # GRANT ADMINISTRATOR PRIVILEGES
+          # ======================================
+
+          $adminGroup = Get-LocalGroup -SID "S-1-5-32-544"
+
+          $adminMember = Get-LocalGroupMember `
+            -Group $adminGroup `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          if (-not $adminMember) {
+              Add-LocalGroupMember `
+                -Group $adminGroup `
+                -Member $username
+          }
+
+          Write-Host "Administrator privileges granted."
+
+          # ======================================
+          # GRANT REMOTE DESKTOP ACCESS
+          # ======================================
+
+          $rdpGroup = Get-LocalGroup -SID "S-1-5-32-555"
+
+          $rdpMember = Get-LocalGroupMember `
+            -Group $rdpGroup `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          if (-not $rdpMember) {
+              Add-LocalGroupMember `
+                -Group $rdpGroup `
+                -Member $username
+          }
+
+          Write-Host "Remote Desktop Users membership granted."
+
+          # ======================================
+          # CONFIGURE USER PROFILE
+          # ======================================
+
+          $user = Get-LocalUser -Name $username
+          $sid = $user.SID.Value
+
+          $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
+
+          New-Item -Path $profileKey -Force | Out-Null
+
+          Set-ItemProperty `
+            -Path $profileKey `
+            -Name "ProfileImagePath" `
+            -Value $env:RDP_PROFILE `
+            -Force
+
+          # Create directories.
+          New-Item -ItemType Directory `
+            -Path $env:RDP_PROFILE -Force | Out-Null
+
+          New-Item -ItemType Directory `
+            -Path $env:RDP_DESKTOP -Force | Out-Null
+
+          New-Item -ItemType Directory `
+            -Path $env:RDP_DOWNLOADS -Force | Out-Null
+
+          # Grant profile access.
+          $acl = Get-Acl $env:RDP_PROFILE
+
+          $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+              $sid,
+              "FullControl",
+              "ContainerInherit,ObjectInherit",
+              "None",
+              "Allow"
+          )
+
+          $acl.SetAccessRule($rule)
+
+          Set-Acl `
+            -Path $env:RDP_PROFILE `
+            -AclObject $acl
+
+          # ======================================
+          # VERIFY PRIVILEGES
+          # ======================================
+
+          Write-Host "=========================================="
+          Write-Host "RDP ACCOUNT CONFIGURATION"
+          Write-Host "=========================================="
+
+          Write-Host "Username: RDP"
+          Write-Host "Password: 1122"
+          Write-Host "Administrator: ENABLED"
+          Write-Host "Remote Desktop Users: ENABLED"
+          Write-Host "Desktop: $env:RDP_DESKTOP"
+
+          Write-Host ""
+          Write-Host "Administrator Group Members:"
+
+          Get-LocalGroupMember -Group $adminGroup |
+            Format-Table Name, ObjectClass
+
+          Write-Host "RDP account configuration completed."
+
+      # ==========================================
+      # 3. INSTALL TAILSCALE
+      # ==========================================
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri $tsUrl `
+            -OutFile $installerPath
+
+          Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
+            -Wait
+
+          Remove-Item $installerPath -Force
+
+      # ==========================================
+      # 4. CONNECT TAILSCALE
+      # ==========================================
+      - name: Establish Tailscale Connection
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          & $tailscale up `
+            --authkey=${{ secrets.TAILSCALE_AUTHKEY }} `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          $tsIP = $null
+          $retries = 0
+
+          while (-not $tsIP -and $retries -lt 15) {
+
+              $tsIP = (& $tailscale ip -4 | Select-Object -First 1).Trim()
+
+              if (-not $tsIP) {
+                  Start-Sleep -Seconds 5
+              }
+
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              throw "Tailscale IP not assigned."
+          }
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale IP: $tsIP"
+
+      # ==========================================
+      # 5. VERIFY RDP ACCESSIBILITY
+      # ==========================================
+      - name: Verify RDP Accessibility
+        shell: powershell
+        run: |
+          $result = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389
+
+          if (-not $result.TcpTestSucceeded) {
+              throw "RDP port 3389 is not accessible."
+          }
+
+          Write-Host "RDP connectivity successful."
+
+      # ==========================================
+      # 6. DOWNLOAD PCYBER APPLICATIONS
+      # ==========================================
+      - name: Download PCYBER Applications
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $downloads = $env:RDP_DOWNLOADS
+
+          New-Item -ItemType Directory `
+            -Path $downloads -Force | Out-Null
+
+          # PBOT.EXE
+          $pbotUrl = "https://github.com/pcyberict/pcyber-rdp-apps/releases/download/v1.0/pbot.exe"
+
+          $pbotPath = Join-Path $downloads "pbot.exe"
+
+          Invoke-WebRequest -Uri $pbotUrl -OutFile $pbotPath
+
+          $expectedHash = "32b69e5102b90d77d521cdd8404511ad1dc031a77c450cf5c80811bc0164cee8"
+
+          $actualHash = (Get-FileHash $pbotPath -Algorithm SHA256).Hash.ToLower()
+
+          if ($actualHash -ne $expectedHash) {
+              throw "pbot.exe SHA256 verification failed."
+          }
+
+          # MAC CHANGER
+          $macUrl = "https://github.com/pcyberict/mcmchanger/releases/download/v1.0/mac_changer.exe"
+
+          $macPath = Join-Path $downloads "mac_changer.exe"
+
+          Invoke-WebRequest -Uri $macUrl -OutFile $macPath
+
+          $macBytes = [System.IO.File]::ReadAllBytes($macPath)
+
+          if ($macBytes.Length -lt 2 -or
+              $macBytes[0] -ne 0x4D -or
+              $macBytes[1] -ne 0x5A) {
+              throw "Invalid mac_changer.exe."
+          }
+
+          # PCYBER TWIST
+          $twistUrl = "https://github.com/pcyberict/mcmchanger/releases/download/v1.0/pcyber-twist.5.zip"
+
+          $twistZip = Join-Path $downloads "pcyber-twist.5.zip"
+
+          Invoke-WebRequest -Uri $twistUrl -OutFile $twistZip
+
+          # CRX BUILD
+          $crxUrl = "https://github.com/pcyberict/mcmchanger/releases/download/v1.0/crx.build.zip"
+
+          $crxZip = Join-Path $downloads "crx.build.zip"
+
+          Invoke-WebRequest -Uri $crxUrl -OutFile $crxZip
+
+          Write-Host "All PCYBER downloads completed."
+
+      # ==========================================
+      # 7. EXTRACT ZIP FILES TO DESKTOP
+      # ==========================================
+      - name: Extract ZIP Files and Copy Downloads
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $desktop = [System.IO.Path]::GetFullPath(
+              $env:RDP_DESKTOP
+          ).TrimEnd('\')
+
+          $downloads = [System.IO.Path]::GetFullPath(
+              $env:RDP_DOWNLOADS
+          ).TrimEnd('\')
+
+          function Expand-ZipToDesktop {
+              param (
+                  [string]$ZipPath,
+                  [string]$Destination
+              )
+
+              Write-Host "Extracting: $ZipPath"
+
+              $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+
+              try {
+                  $entries = @($zip.Entries | Where-Object {
+                      -not [string]::IsNullOrWhiteSpace($_.FullName)
+                  })
+
+                  $files = @($entries | Where-Object {
+                      -not $_.FullName.EndsWith("/")
+                  })
+
+                  $commonRoot = $null
+                  $canStripRoot = ($files.Count -gt 0)
+
+                  foreach ($file in $files) {
+
+                      $normalized = $file.FullName.Replace('\', '/')
+
+                      if ($normalized -notmatch '^([^/]+)/.+$') {
+                          $canStripRoot = $false
+                          break
+                      }
+
+                      $topFolder = $Matches[1]
+
+                      if ($null -eq $commonRoot) {
+                          $commonRoot = $topFolder
+                      }
+                      elseif ($commonRoot -ne $topFolder) {
+                          $canStripRoot = $false
+                          break
+                      }
+                  }
+
+                  $prefix = ""
+
+                  if ($canStripRoot -and $commonRoot) {
+                      $prefix = $commonRoot + "/"
+                  }
+
+                  foreach ($entry in $entries) {
+
+                      $entryName = $entry.FullName.Replace('\', '/')
+
+                      if ($canStripRoot) {
+                          if ($entryName.StartsWith(
+                              $prefix,
+                              [System.StringComparison]::OrdinalIgnoreCase
+                          )) {
+                              $entryName = $entryName.Substring($prefix.Length)
+                          }
+                          else {
+                              continue
+                          }
+                      }
+
+                      if ([string]::IsNullOrWhiteSpace($entryName)) {
+                          continue
+                      }
+
+                      if ($entryName.StartsWith("/") -or
+                          $entryName -match '^[A-Za-z]:' -or
+                          $entryName.Split('/') -contains '..') {
+                          throw "Unsafe ZIP entry: $($entry.FullName)"
+                      }
+
+                      $relative = $entryName.Replace(
+                          '/',
+                          [System.IO.Path]::DirectorySeparatorChar
+                      )
+
+                      $target = [System.IO.Path]::GetFullPath(
+                          (Join-Path $Destination $relative)
+                      )
+
+                      if (-not $target.StartsWith(
+                          ($Destination + '\'),
+                          [System.StringComparison]::OrdinalIgnoreCase
+                      )) {
+                          throw "ZIP extraction outside Desktop blocked."
+                      }
+
+                      if ($entry.FullName.EndsWith("/")) {
+                          New-Item -ItemType Directory `
+                            -Path $target -Force | Out-Null
+                          continue
+                      }
+
+                      New-Item -ItemType Directory `
+                        -Path (Split-Path -Parent $target) `
+                        -Force | Out-Null
+
+                      $inputStream = $entry.Open()
+                      $outputStream = [System.IO.File]::Create($target)
+
+                      try {
+                          $inputStream.CopyTo($outputStream)
+                      }
+                      finally {
+                          $outputStream.Dispose()
+                          $inputStream.Dispose()
+                      }
+                  }
+              }
+              finally {
+                  $zip.Dispose()
+              }
+          }
+
+          # Extract every downloaded ZIP.
+          Get-ChildItem -Path $downloads -Filter "*.zip" -File -Recurse |
+            ForEach-Object {
+                Expand-ZipToDesktop `
+                  -ZipPath $_.FullName `
+                  -Destination $desktop
+            }
+
+          # Copy every ordinary file.
+          Get-ChildItem -Path $downloads -File -Recurse |
+            Where-Object { $_.Extension -ne ".zip" } |
+            ForEach-Object {
+
+                $relative = $_.FullName.Substring(
+                    $downloads.Length
+                ).TrimStart('\')
+
+                $destination = Join-Path $desktop $relative
+
+                New-Item -ItemType Directory `
+                  -Path (Split-Path -Parent $destination) `
+                  -Force | Out-Null
+
+                Copy-Item $_.FullName $destination -Force
+            }
+
+          Write-Host "All PCYBER files extracted and copied."
+
+      # ==========================================
+      # 8. DOWNLOAD AND RUN DOWNLOADS.BAT
+      # ==========================================
+      - name: Run Downloads.bat and Collect Files
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $profile = $env:RDP_PROFILE
+          $desktop = $env:RDP_DESKTOP
+          $downloads = $env:RDP_DOWNLOADS
+
+          $startupPath = Join-Path $profile `
+            "AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+
+          New-Item -ItemType Directory `
+            -Path $startupPath -Force | Out-Null
+
+          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+
+          $downloadPath = Join-Path $startupPath "Downloads.bat"
+
+          Invoke-WebRequest `
+            -Uri $downloadUrl `
+            -OutFile $downloadPath `
+            -UseBasicParsing
+
+          Write-Host "Downloads.bat downloaded."
+
+          $process = Start-Process `
+            -FilePath "cmd.exe" `
+            -ArgumentList "/c `"$downloadPath`"" `
+            -WorkingDirectory $downloads `
+            -Wait `
+            -PassThru
+
+          Write-Host "Downloads.bat exit code: $($process.ExitCode)"
+
+          # Collect additional ZIP files.
+          Get-ChildItem -Path $downloads -Filter "*.zip" -File -Recurse |
+            ForEach-Object {
+
+                $target = Join-Path $desktop (
+                    "Additional_" +
+                    [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
+                )
+
+                New-Item -ItemType Directory `
+                  -Path $target -Force | Out-Null
+
+                Expand-Archive `
+                  -LiteralPath $_.FullName `
+                  -DestinationPath $target `
+                  -Force
+            }
+
+          # Copy additional ordinary downloads.
+          Get-ChildItem -Path $downloads -File -Recurse |
+            Where-Object { $_.Extension -ne ".zip" } |
+            ForEach-Object {
+
+                $relative = $_.FullName.Substring(
+                    $downloads.Length
+                ).TrimStart('\')
+
+                $destination = Join-Path $desktop $relative
+
+                New-Item -ItemType Directory `
+                  -Path (Split-Path -Parent $destination) `
+                  -Force | Out-Null
+
+                Copy-Item $_.FullName $destination -Force
+            }
+
+          # ======================================
+          # FINAL ACCESS DETAILS
+          # ======================================
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "RDP ACCESS DETAILS"
+          Write-Host "=========================================="
+
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: 1122"
+          Write-Host "Administrator: ENABLED"
+          Write-Host "Remote Desktop Users: ENABLED"
+          Write-Host "Desktop: $desktop"
+
+          Write-Host ""
+          Write-Host "FINAL DESKTOP CONTENTS"
+
+          Get-ChildItem -Path $desktop -Force -Recurse |
+            Select-Object Mode, Name, Length |
+            Format-Table -AutoSize
+
+          # ======================================
+          # KEEP RDP SESSION ALIVE
+          # ======================================
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP ACTIVE - $env:TAILSCALE_IP"
+              Start-Sleep -Seconds 300
+          }
